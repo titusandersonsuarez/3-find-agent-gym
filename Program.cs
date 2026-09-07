@@ -1,7 +1,59 @@
 using System.Net;
+using System.Net.Http.Json;
 using LeadGym.AI.Agents;
 using LeadGym.AI.Configuration;
 using Microsoft.Extensions.Configuration;
+
+async Task ValidateGeminiAccessAsync(string apiKey, string modelId)
+{
+    if (string.IsNullOrWhiteSpace(apiKey) || apiKey.Contains("TU_GEMINI", StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidOperationException("La clave de Gemini no está configurada. Revisa 'ApiSettings:GeminiApiKey' en appsettings.json.");
+    }
+
+    if (string.IsNullOrWhiteSpace(modelId))
+    {
+        throw new InvalidOperationException("El modelo de Gemini no está configurado. Revisa 'ApiSettings:GeminiModelId' en appsettings.json.");
+    }
+
+    using var client = new HttpClient();
+    var uri = $"https://generativelanguage.googleapis.com/v1beta/models/{modelId}:generateContent?key={apiKey}";
+
+    try
+    {
+        var response = await client.PostAsJsonAsync(uri, new
+        {
+            contents = new[]
+            {
+                new
+                {
+                    parts = new[]
+                    {
+                        new { text = "Prueba de conexión" }
+                    }
+                }
+            }
+        });
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = await response.Content.ReadAsStringAsync();
+            throw new HttpRequestException(
+                $"Gemini respondió con {(int)response.StatusCode} ({response.StatusCode}). " +
+                $"Detalle: {body}",
+                null,
+                response.StatusCode);
+        }
+    }
+    catch (HttpRequestException)
+    {
+        throw;
+    }
+    catch (Exception ex)
+    {
+        throw new InvalidOperationException("No se pudo validar la conexión con Gemini. Revisa la clave y el modelo configurados.", ex);
+    }
+}
 
 void PrintErrorBanner(string title, string message)
 {
@@ -12,6 +64,17 @@ void PrintErrorBanner(string title, string message)
     Console.WriteLine("==============================================");
     Console.WriteLine(message);
     Console.ResetColor();
+}
+
+string MaskSecret(string value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+        return "No configurada";
+
+    if (value.Length <= 8)
+        return "********";
+
+    return value.Substring(0, 4) + "********" + value.Substring(value.Length - 4);
 }
 
 string BuildFriendlyErrorMessage(Exception ex)
@@ -79,15 +142,25 @@ try
     var apiSettings = configuration.GetSection("ApiSettings").Get<ApiSettings>()
         ?? throw new InvalidOperationException("No se pudo cargar la sección 'ApiSettings' desde appsettings.json.");
 
-    if (string.IsNullOrWhiteSpace(apiSettings.GeminiApiKey) || apiSettings.GeminiApiKey.Contains("TU_GEMINI"))
+    Console.WriteLine("[+] Configuración cargada:");
+    Console.WriteLine($"    - Modelo Gemini: {apiSettings.GeminiModelId}");
+    Console.WriteLine($"    - Clave Gemini: {MaskSecret(apiSettings.GeminiApiKey)}");
+    Console.WriteLine($"    - Clave Serper: {MaskSecret(apiSettings.SerperApiKey)}");
+    Console.WriteLine("    - Archivo: appsettings.json");
+    Console.WriteLine();
+
+    if (string.IsNullOrWhiteSpace(apiSettings.GeminiApiKey) || apiSettings.GeminiApiKey.Contains("TU_GEMINI", StringComparison.OrdinalIgnoreCase))
     {
         throw new InvalidOperationException("La clave de Gemini no está configurada. Revisa 'ApiSettings:GeminiApiKey' en appsettings.json.");
     }
 
-    if (string.IsNullOrWhiteSpace(apiSettings.SerperApiKey) || apiSettings.SerperApiKey.Contains("TU_SERPER"))
+    if (string.IsNullOrWhiteSpace(apiSettings.SerperApiKey) || apiSettings.SerperApiKey.Contains("TU_SERPER", StringComparison.OrdinalIgnoreCase))
     {
         throw new InvalidOperationException("La clave de Serper no está configurada. Revisa 'ApiSettings:SerperApiKey' en appsettings.json.");
     }
+
+    Console.WriteLine("[+] Validando acceso a Gemini...");
+    await ValidateGeminiAccessAsync(apiSettings.GeminiApiKey, apiSettings.GeminiModelId);
 
     Console.WriteLine("[+] Inicializando Agente 1 (Prospector)...");
     var prospector = new ProspectorAgent(apiSettings.GeminiApiKey, apiSettings.GeminiModelId, apiSettings.SerperApiKey);
