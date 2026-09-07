@@ -1,0 +1,23 @@
+# Secrets and local config
+appsettings.json
+appsettings.Development.json
+appsettings.Local.json
+*.user
+*.suo
+.env
+.env.*
+
+# VS / IDE
+.vs/
+.vscode/
+*.code-workspace
+
+# Build artifacts
+bin/
+obj/
+TestResults/
+*.log
+
+# OS files
+Thumbs.db
+.DS_Store

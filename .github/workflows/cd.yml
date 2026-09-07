@@ -1,0 +1,31 @@
+name: CD
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Publish app
+        run: dotnet publish LeadGym.AI.csproj -c Release -o publish
+
+      - name: Upload published artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: leadgym-ai-artifact
+          path: publish/
