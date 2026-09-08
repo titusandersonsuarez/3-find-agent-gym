@@ -43,7 +43,6 @@ jobs:
   azure-connection-check:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.check_azure == true }}
     runs-on: ubuntu-latest
-    environment: azure-check
 
     steps:
       - name: Login to Azure with OIDC
