@@ -2,8 +2,18 @@ name: CD
 
 on:
   workflow_dispatch:
+    inputs:
+      check_azure:
+        description: "Comprobar la conexión OIDC con Azure (no despliega)"
+        required: true
+        type: boolean
+        default: false
   push:
     branches: [ main, master ]
+
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
   publish:
@@ -29,3 +39,19 @@ jobs:
         with:
           name: leadgym-ai-artifact
           path: publish/
+
+  azure-connection-check:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.check_azure == true }}
+    runs-on: ubuntu-latest
+    environment: azure-check
+
+    steps:
+      - name: Login to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify Azure subscription
+        run: az account show --output table

@@ -102,11 +102,14 @@ El repositorio incluye workflows de GitHub Actions para:
 
 - CI: compilar al hacer push o pull request.
 - CD: publicar el artefacto compilado.
+- Comprobación opcional de conexión OIDC con Azure, sin desplegar.
 
 Los archivos están en:
 
 - `.github/workflows/ci.yml`
 - `.github/workflows/cd.yml`
+
+La comprobación de Azure se ejecuta desde GitHub Actions seleccionando `Run workflow` y activando `check_azure`. Requiere configurar estos secretos del repositorio: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` y `AZURE_SUBSCRIPTION_ID`. Esta opción únicamente inicia sesión y ejecuta `az account show`; no crea recursos ni despliega la aplicación.
 
 ## Seguridad
 
