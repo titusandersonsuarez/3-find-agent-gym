@@ -2,6 +2,7 @@
 
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
+using Microsoft.SemanticKernel.Connectors.Google;
 
 namespace LeadGym.AI.Agents;
 
@@ -42,8 +43,38 @@ public class EmailCopywriterAgent
             $"Basado en este Reporte de Auditoría Digital:\n{auditReport}"
         );
 
-        var result = await chatCompletion.GetChatMessageContentAsync(history, kernel: _kernel);
-        return result.Content ?? "No se pudo generar la propuesta de correo.";
+        ChatMessageContent? result = null;
+        var settings = new GeminiPromptExecutionSettings
+        {
+            Temperature = 0.7,
+            MaxTokens = 2048
+        };
+
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            try
+            {
+                result = await chatCompletion.GetChatMessageContentAsync(history, settings, _kernel);
+                break;
+            }
+            catch (Exception ex) when (attempt < 3 && (ex.Message.Contains("503") || ex.Message.Contains("ServiceUnavailable")))
+            {
+                Console.WriteLine($"[!] Gemini está ocupado. Reintentando Copywriter ({attempt}/3)...");
+                await Task.Delay(TimeSpan.FromSeconds(attempt * 2));
+            }
+        }
+
+        if (result is null)
+            throw new InvalidOperationException("Gemini no pudo responder al Copywriter después de varios intentos.");
+
+        var content = GetFullContent(result);
+        return string.IsNullOrWhiteSpace(content) ? "No se pudo generar la propuesta de correo." : content;
+    }
+
+    private static string GetFullContent(ChatMessageContent message)
+    {
+        return string.Join(Environment.NewLine,
+            message.Items.OfType<TextContent>().Select(item => item.Text));
     }
 }
 #pragma warning restore SKEXP0070

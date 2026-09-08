@@ -1,10 +1,13 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Net.Mail;
+using System.Text.Json;
+using LeadGym.AI.Models;
 using LeadGym.AI.Agents;
 using LeadGym.AI.Configuration;
 using Microsoft.Extensions.Configuration;
 
-async Task ValidateGeminiAccessAsync(string apiKey, string modelId)
+async Task<string> ValidateGeminiAccessAsync(string apiKey, string modelId)
 {
     if (string.IsNullOrWhiteSpace(apiKey) || apiKey.Contains("TU_GEMINI", StringComparison.OrdinalIgnoreCase))
     {
@@ -16,43 +19,90 @@ async Task ValidateGeminiAccessAsync(string apiKey, string modelId)
         throw new InvalidOperationException("El modelo de Gemini no está configurado. Revisa 'ApiSettings:GeminiModelId' en appsettings.json.");
     }
 
-    using var client = new HttpClient();
-    var uri = $"https://generativelanguage.googleapis.com/v1beta/models/{modelId}:generateContent?key={apiKey}";
+    using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+    var modelsToTry = new[] { modelId }.Distinct(StringComparer.OrdinalIgnoreCase);
+    HttpRequestException? lastError = null;
 
-    try
+    foreach (var candidateModel in modelsToTry)
     {
-        var response = await client.PostAsJsonAsync(uri, new
+        var uri = $"https://generativelanguage.googleapis.com/v1beta/models/{candidateModel}:generateContent?key={apiKey}";
+
+        for (var attempt = 1; attempt <= 3; attempt++)
         {
-            contents = new[]
+            try
             {
-                new
+                var response = await client.PostAsJsonAsync(uri, new
                 {
-                    parts = new[]
+                    contents = new[]
                     {
-                        new { text = "Prueba de conexión" }
+                        new
+                        {
+                            parts = new[]
+                            {
+                                new { text = "Prueba de conexión" }
+                            }
+                        }
                     }
+                });
+
+                if (response.IsSuccessStatusCode)
+                {
+                    return candidateModel;
+                }
+
+                var body = await response.Content.ReadAsStringAsync();
+                lastError = new HttpRequestException(
+                    $"Gemini respondió con {(int)response.StatusCode} ({response.StatusCode}) usando '{candidateModel}'. " +
+                    $"Detalle: {body}",
+                    null,
+                    response.StatusCode);
+
+                if (response.StatusCode != HttpStatusCode.ServiceUnavailable && response.StatusCode != HttpStatusCode.TooManyRequests)
+                {
+                    break;
+                }
+
+                if (attempt < 3)
+                {
+                    Console.WriteLine($"[!] Gemini está ocupado con '{candidateModel}'. Reintentando ({attempt}/3)...");
+                    await Task.Delay(TimeSpan.FromSeconds(attempt * 2));
                 }
             }
-        });
+            catch (HttpRequestException ex)
+            {
+                lastError = ex;
+                var isPermanentError = ex.StatusCode.HasValue &&
+                    ex.StatusCode != HttpStatusCode.ServiceUnavailable &&
+                    ex.StatusCode != HttpStatusCode.TooManyRequests;
 
-        if (!response.IsSuccessStatusCode)
-        {
-            var body = await response.Content.ReadAsStringAsync();
-            throw new HttpRequestException(
-                $"Gemini respondió con {(int)response.StatusCode} ({response.StatusCode}). " +
-                $"Detalle: {body}",
-                null,
-                response.StatusCode);
+                if (isPermanentError)
+                {
+                    break;
+                }
+
+                if (attempt < 3)
+                {
+                    Console.WriteLine($"[!] Error temporal de Gemini. Reintentando ({attempt}/3)...");
+                    await Task.Delay(TimeSpan.FromSeconds(attempt * 2));
+                }
+            }
+            catch (TaskCanceledException ex)
+            {
+                lastError = new HttpRequestException("Gemini tardó demasiado en responder.", ex);
+                if (attempt < 3)
+                {
+                    Console.WriteLine($"[!] Gemini tardó demasiado. Reintentando ({attempt}/3)...");
+                    await Task.Delay(TimeSpan.FromSeconds(attempt * 2));
+                }
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException("No se pudo validar la conexión con Gemini. Revisa la clave y el modelo configurados.", ex);
+            }
         }
     }
-    catch (HttpRequestException)
-    {
-        throw;
-    }
-    catch (Exception ex)
-    {
-        throw new InvalidOperationException("No se pudo validar la conexión con Gemini. Revisa la clave y el modelo configurados.", ex);
-    }
+
+    throw lastError ?? new HttpRequestException("Gemini no respondió durante la validación.");
 }
 
 void PrintErrorBanner(string title, string message)
@@ -128,6 +178,35 @@ string BuildFriendlyErrorMessage(Exception ex)
     return $"Ocurrió un problema inesperado.\nDetalle técnico: {combined}";
 }
 
+async Task SendDraftsEmailAsync(string draftsPath, int draftsCount, EmailSettings settings)
+{
+    if (string.IsNullOrWhiteSpace(settings.Username) ||
+        string.IsNullOrWhiteSpace(settings.Password) ||
+        settings.Password.Contains("TU_", StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine("[!] EmailSettings no está configurado. Los borradores quedaron guardados localmente, pero no se enviaron.");
+        return;
+    }
+
+    var sender = string.IsNullOrWhiteSpace(settings.From) ? settings.Username : settings.From;
+    using var message = new MailMessage(sender, settings.To)
+    {
+        Subject = $"LeadGym AI: {draftsCount} borradores pendientes de revisión",
+        Body = "Se adjunta el archivo JSON con los borradores personalizados generados por LeadGym AI. " +
+               "Todos están en estado Pendiente y no se han enviado a los gimnasios."
+    };
+    message.Attachments.Add(new Attachment(draftsPath, "application/json"));
+
+    using var smtpClient = new SmtpClient(settings.SmtpHost, settings.SmtpPort)
+    {
+        EnableSsl = true,
+        Credentials = new NetworkCredential(settings.Username, settings.Password)
+    };
+
+    await smtpClient.SendMailAsync(message);
+    Console.WriteLine($"[+] Borradores enviados a {settings.To}.");
+}
+
 Console.WriteLine("==============================================");
 Console.WriteLine("    LEADGYM AI - Sistema Agéntico (C#)        ");
 Console.WriteLine("==============================================\n");
@@ -136,11 +215,13 @@ try
 {
     var configuration = new ConfigurationBuilder()
         .SetBasePath(Directory.GetCurrentDirectory())
-        .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+        .AddJsonFile("appsettings.json", optional: true, reloadOnChange: false)
+        .AddEnvironmentVariables()
         .Build();
 
     var apiSettings = configuration.GetSection("ApiSettings").Get<ApiSettings>()
         ?? throw new InvalidOperationException("No se pudo cargar la sección 'ApiSettings' desde appsettings.json.");
+    var emailSettings = configuration.GetSection("EmailSettings").Get<EmailSettings>() ?? new EmailSettings();
 
     Console.WriteLine("[+] Configuración cargada:");
     Console.WriteLine($"    - Modelo Gemini: {apiSettings.GeminiModelId}");
@@ -160,47 +241,89 @@ try
     }
 
     Console.WriteLine("[+] Validando acceso a Gemini...");
-    await ValidateGeminiAccessAsync(apiSettings.GeminiApiKey, apiSettings.GeminiModelId);
+    var activeModelId = await ValidateGeminiAccessAsync(apiSettings.GeminiApiKey, apiSettings.GeminiModelId);
+    if (!string.Equals(activeModelId, apiSettings.GeminiModelId, StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine($"[+] Modelo alternativo activo: {activeModelId}");
+    }
 
     Console.WriteLine("[+] Inicializando Agente 1 (Prospector)...");
-    var prospector = new ProspectorAgent(apiSettings.GeminiApiKey, apiSettings.GeminiModelId, apiSettings.SerperApiKey);
+    var prospector = new ProspectorAgent(apiSettings.GeminiApiKey, activeModelId, apiSettings.SerperApiKey);
 
     Console.WriteLine("[+] Inicializando Agente 2 (Auditor Digital)...");
-    var auditor = new AuditorAgent(apiSettings.GeminiApiKey, apiSettings.GeminiModelId);
+    var auditor = new AuditorAgent(apiSettings.GeminiApiKey, activeModelId);
 
     Console.WriteLine("[+] Inicializando Agente 3 (Email Copywriter)...");
-    var copywriter = new EmailCopywriterAgent(apiSettings.GeminiApiKey, apiSettings.GeminiModelId);
+    var copywriter = new EmailCopywriterAgent(apiSettings.GeminiApiKey, activeModelId);
 
-    string targetCity = "Bucaramanga";
+    var targetCity = string.IsNullOrWhiteSpace(apiSettings.TargetCity) ? "Bucaramanga" : apiSettings.TargetCity;
+    var maxProspects = Math.Clamp(apiSettings.MaxProspects, 1, 20);
 
     Console.WriteLine($"\n[+] PASO 1: Buscando gimnasios en {targetCity}...");
-    string prospectResults = await prospector.SearchGymsAsync(targetCity);
+    List<GymProspect> prospects = (await prospector.SearchGymsAsync(targetCity))
+        .Take(maxProspects)
+        .ToList();
 
     Console.ForegroundColor = ConsoleColor.Green;
     Console.WriteLine("\n--- RESULTADO DEL AGENTE 1 (PROSPECTOR) ---");
     Console.ResetColor();
-    Console.WriteLine(prospectResults);
+    Console.WriteLine($"Se encontraron {prospects.Count} prospectos.");
 
-    Console.WriteLine("\n------------------------------------------------");
-    string testGymName = "Smart Body Gym";
-    string testGymUrl = "https://www.google.com";
+    var draftsDirectory = Path.Combine(Directory.GetCurrentDirectory(), "data");
+    Directory.CreateDirectory(draftsDirectory);
+    var draftsPath = Path.Combine(draftsDirectory, $"email-drafts-{DateTime.UtcNow:yyyyMMdd-HHmmss}.json");
+    var emailDrafts = new List<EmailDraft>();
+    var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
 
-    Console.WriteLine($"[+] PASO 2: Auditando presencia digital de '{testGymName}'...");
-    string auditReport = await auditor.AnalyzeWebsiteAsync(testGymName, testGymUrl);
+    void SaveDrafts()
+    {
+        File.WriteAllText(draftsPath, JsonSerializer.Serialize(emailDrafts, jsonOptions));
+    }
 
-    Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.WriteLine("\n--- RESULTADO DEL AGENTE 2 (AUDITOR) ---");
-    Console.ResetColor();
-    Console.WriteLine(auditReport);
+    foreach (var prospect in prospects)
+    {
+        Console.WriteLine("\n------------------------------------------------");
+        Console.WriteLine($"[+] PROSPECTO: {prospect.Name} ({prospect.Location})");
 
-    Console.WriteLine("\n------------------------------------------------");
-    Console.WriteLine("[+] PASO 3: Redactando propuesta comercial personalizada...");
-    string coldEmail = await copywriter.GenerateColdEmailAsync(testGymName, auditReport);
+        string auditReport;
+        if (prospect.HasWebsite)
+        {
+            Console.WriteLine("[+] PASO 2: Auditando presencia digital...");
+            auditReport = await auditor.AnalyzeWebsiteAsync(prospect.Name, prospect.WebsiteUrl!);
 
-    Console.ForegroundColor = ConsoleColor.Yellow;
-    Console.WriteLine("\n--- RESULTADO DEL AGENTE 3 (EMAIL COPYWRITER) ---");
-    Console.ResetColor();
-    Console.WriteLine(coldEmail);
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("\n--- RESULTADO DEL AGENTE 2 (AUDITOR) ---");
+            Console.ResetColor();
+            Console.WriteLine(auditReport);
+        }
+        else
+        {
+            auditReport = "El gimnasio no tiene un sitio web identificado. Evaluar una propuesta de presencia digital y agendamiento desde cero.";
+            Console.WriteLine("[!] Sin sitio web: se omite la auditoría y se continúa con una oportunidad de presencia digital.");
+        }
+
+        Console.WriteLine("\n[+] PASO 3: Redactando propuesta comercial personalizada...");
+        string coldEmail = await copywriter.GenerateColdEmailAsync(prospect.Name, auditReport);
+
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("\n--- RESULTADO DEL AGENTE 3 (EMAIL COPYWRITER) ---");
+        Console.ResetColor();
+        Console.WriteLine(coldEmail);
+
+        emailDrafts.Add(new EmailDraft
+        {
+            Prospect = prospect,
+            AuditReport = auditReport,
+            Email = coldEmail,
+            Status = "Pendiente",
+            GeneratedAtUtc = DateTime.UtcNow
+        });
+        SaveDrafts();
+        Console.WriteLine($"[+] Borrador guardado en: {draftsPath}");
+    }
+
+    Console.WriteLine($"\n[+] Se guardaron {emailDrafts.Count} borradores para revisión manual.");
+    await SendDraftsEmailAsync(draftsPath, emailDrafts.Count, emailSettings);
 
     Console.WriteLine("\n==============================================");
     Console.WriteLine("    ¡Flujo completo ejecutado con éxito!      ");
@@ -208,10 +331,18 @@ try
 }
 catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
 {
-    PrintErrorBanner("API NO ENCONTRADA (404)",
-        "La API externa no respondió en la URL esperada.\n" +
-        "Esto suele pasar por una URL incorrecta, una clave inválida o una API que no existe en ese endpoint.\n\n" +
-        "Revisa la configuración de Serper y la URL del servicio.");
+        var isGeminiError = ex.Message.Contains("Gemini", StringComparison.OrdinalIgnoreCase);
+        var title = isGeminiError ? "GEMINI NO DISPONIBLE (404)" : "API NO ENCONTRADA (404)";
+        var message = isGeminiError
+                ? "Gemini no pudo ejecutar generateContent con la clave o el modelo configurados.\n" +
+                    "El modelo debe existir y la clave debe tener acceso a la API Generative Language.\n\n" +
+                    "Revisa 'ApiSettings:GeminiApiKey' y 'ApiSettings:GeminiModelId' en appsettings.json.\n" +
+                    $"Detalle técnico: {ex.Message}"
+                : "La API externa no respondió en la URL esperada.\n" +
+                    "Esto suele pasar por una URL incorrecta o una clave inválida.\n\n" +
+                    $"Detalle técnico: {ex.Message}";
+
+        PrintErrorBanner(title, message);
 }
 catch (HttpRequestException ex)
 {
@@ -240,6 +371,3 @@ catch (Exception ex)
 
     PrintErrorBanner("ERROR DE GEMINI", friendly);
 }
-
-Console.WriteLine("\nPresiona cualquier tecla para finalizar...");
-Console.ReadKey();
